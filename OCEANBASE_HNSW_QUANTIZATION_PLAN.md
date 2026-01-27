@@ -32,7 +32,7 @@
 
 | Finding | Impact | Severity |
 |---------|--------|----------|
-| **HNSW_BQ does NOT support `inner_product` distance** | FastGPT uses `inner_product` for all vector searches | 🔴 **BLOCKER** |
+| **HNSW_BQ + `inner_product`** | Docs say unsupported, but source code shows BP3+ may support | 🟡 **VERIFY** |
 | Current OceanBase version `4.3.5-lts` has no BP suffix | Likely base version (BP0), missing quantization features | �� **BLOCKER** |
 | HNSW_SQ requires BP1+, HNSW_BQ requires BP2+ | Version upgrade required | 🟡 High |
 | HNSW_BQ cosine support only from BP4+ | Limited distance options even after upgrade | 🟡 High |
@@ -694,6 +694,9 @@ SELECT * FROM V$OB_VECTOR_MEMORY;
 
 ## Appendix D: Decision Log
 
+- [Appendix E: NEW FINDINGS](#appendix-e-new-findings-updated-2026-01-27)
+- [Appendix F: Scope Check Draft for Maintainers](#appendix-f-scope-check-draft-for-maintainers)
+
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-01-27 | Recommend HNSW_SQ only for Phase 1 | HNSW_BQ incompatible with inner_product |
@@ -704,3 +707,691 @@ SELECT * FROM V$OB_VECTOR_MEMORY;
 
 *Document generated: January 27, 2026*  
 *Based on: OceanBase 4.3.5 documentation and FastGPT v4.14.5.1 codebase*
+
+---
+
+## Appendix E: NEW FINDINGS (Updated 2026-01-27)
+
+### E.1 Critical Discovery: BP3+ May Support inner_product for HNSW_BQ
+
+**Source**: OceanBase source code analysis (`src/share/vector_index/ob_vector_index_util.cpp`)
+
+```cpp
+// From OceanBase source code
+if (type_hnsw_bq_is_set && !is_enable_bp_cosine_and_ip && distance_name != "L2") {
+  ret = OB_NOT_SUPPORTED;
+}
+```
+
+The `is_enable_bp_cosine_and_ip` flag controls inner_product/cosine support for HNSW_BQ:
+
+| Version Range | `is_enable_bp_cosine_and_ip` | HNSW_BQ + inner_product |
+|---------------|------------------------------|-------------------------|
+| < 4.3.5.3 | `false` | ❌ NOT supported |
+| [4.3.5.3, 4.4.0.0) | `true` | ✅ **MAY BE supported** |
+| [4.4.0.0, 4.4.1.0) | `false` | ❌ NOT supported |
+| >= 4.4.1.0 | `true` | ✅ **MAY BE supported** |
+
+**Implication**: This contradicts the documentation! **Version 4.3.5.3 (BP3+) may actually support `inner_product` for HNSW_BQ.**
+
+⚠️ **Action Required**: Verify this finding by testing with OceanBase 4.3.5.3+ before implementation.
+
+
+### E.2 Docker Image Tag Mapping (Verified)
+
+**Finding**: OceanBase Docker Hub does NOT use explicit BP tags like `4.3.5-bp1`.
+
+**Actual Format**: `4.3.5.X-BUILDNUMBER` where X corresponds to BP version.
+
+| Docker Tag Example | BP Version | Release Date (approx) |
+|--------------------|------------|----------------------|
+| `4.3.5.1-...` | BP1 | 2025-03-18 |
+| `4.3.5.2-...` | BP2 | 2025-05-15 |
+| `4.3.5.3-...` | BP3 | 2025-07-21 |
+| `4.3.5.4-...` | BP4 | 2025-09-10 |
+| `4.3.5.5-105000012025111711` | BP5 | 2025-11-17 |
+
+**Current FastGPT**: Uses `4.3.5-lts` which is the base version (effectively BP0).
+
+**Recommended Update**: 
+```json
+// deploy/args.json
+{
+  "tags": {
+    "oceanbase": "4.3.5.3"  // For HNSW_SQ + potentially HNSW_BQ with inner_product
+  }
+}
+```
+
+
+### E.3 Index Rebuild Methods (Confirmed)
+
+**Method 1: DROP + CREATE** (Recommended for index type changes)
+```sql
+-- Step 1: Drop existing index
+DROP INDEX vector_index ON modeldata;
+
+-- Step 2: Create new index with different type
+CREATE VECTOR INDEX vector_index ON modeldata(vector) 
+WITH (distance=inner_product, type=hnsw_sq, m=32, ef_construction=128);
+```
+
+**Method 2: REBUILD_INDEX Procedure** (For index refresh, same type)
+```sql
+-- Full refresh of existing index
+CALL dbms_vector.rebuild_index('vector_index');
+```
+
+**Note**: `REBUILD_INDEX` does a full refresh but keeps the same index type. For changing HNSW → HNSW_SQ, use DROP + CREATE.
+
+**Memory Optimization**: Enable memory saving mode during rebuild:
+```sql
+-- Reduce memory usage during index operations
+ALTER SYSTEM SET vector_index_memory_saving_mode = 'ON';
+```
+
+
+---
+
+## Appendix F: Scope Check Draft for Maintainers
+
+### F.1 Summary for Review
+
+**Feature**: Add OceanBase HNSW quantization support (8-bit HNSW_SQ, 1-bit HNSW_BQ) via `VECTOR_VQ_LEVEL` environment variable.
+
+**Current Status**: 
+- Neither HNSW_SQ nor HNSW_BQ is implemented in FastGPT for OceanBase
+- OceanBase version in deploy/args.json is `4.3.5-lts` (base version, no BP features)
+- PgVector already has half-precision (16-bit) support as reference
+
+### F.2 Questions for FastGPT Maintainers
+
+#### Q1: Environment Variable Approach
+> **Current Proposal**: Extend `VECTOR_VQ_LEVEL` to support value `8` for OceanBase HNSW_SQ.
+> 
+> **Alternative**: Create separate `OCEANBASE_INDEX_TYPE` variable.
+> 
+> **Question**: Which approach aligns better with the project's configuration philosophy?
+
+#### Q2: Minimum Version Enforcement
+> **Issue**: HNSW_SQ requires OceanBase 4.3.5.1+ (BP1), HNSW_BQ requires 4.3.5.2+ (BP2).
+> 
+> **Question**: Should FastGPT:
+> - (a) Check OceanBase version at startup and fail if incompatible?
+> - (b) Log a warning but continue?
+> - (c) Simply document the requirement?
+
+#### Q3: HNSW_BQ Compatibility Concern
+> **Issue**: Documentation says HNSW_BQ does NOT support `inner_product`, but source code analysis suggests BP3+ (4.3.5.3+) may support it via `is_enable_bp_cosine_and_ip` flag.
+> 
+> **Question**: Should we:
+> - (a) Only implement HNSW_SQ (8-bit) for now (safe path)?
+> - (b) Implement both after verifying BP3+ supports inner_product?
+> - (c) Implement HNSW_BQ with L2 distance as optional configuration?
+
+#### Q4: Docker Image Version Update
+> **Current**: `oceanbase: "4.3.5-lts"`
+> 
+> **Required**: At least `4.3.5.1` for HNSW_SQ, `4.3.5.3` recommended for potential HNSW_BQ support.
+> 
+> **Question**: Is updating the default OceanBase version acceptable?
+
+
+### F.3 Questions for OceanBase Team
+
+#### Q1: inner_product Support for HNSW_BQ (Clarification Request)
+> **Documentation States**: HNSW_BQ only supports `l2` and `cosine` (cosine from BP4+).
+> 
+> **Source Code Shows**: `is_enable_bp_cosine_and_ip` flag enables inner_product for HNSW_BQ in versions `[4.3.5.3, 4.4.0.0)` and `[4.4.1.0, )`.
+> 
+> **Question**: Can you confirm whether HNSW_BQ supports `inner_product` distance in version 4.3.5.3+?
+> 
+> **Context**: FastGPT uses `inner_product` as its distance metric for all vector databases. If HNSW_BQ supports inner_product, we can implement 1-bit quantization. Otherwise, it's a blocker.
+
+#### Q2: Docker Image Tag Convention
+> **Observation**: Docker Hub shows tags like `4.3.5.5-105000012025111711` but no explicit `-bp1`, `-bp2` tags.
+> 
+> **Question**: Is the convention `4.3.5.X` where X = BP version number?
+> 
+> **Question**: What tag should we use for production deployments requiring BP1+ features?
+
+#### Q3: HNSW_SQ + inner_product Confirmation
+> **Question**: Can you confirm that HNSW_SQ fully supports `inner_product` distance metric?
+> 
+> **Use Case**: We plan to use `CREATE VECTOR INDEX ... WITH (distance=inner_product, type=hnsw_sq, ...)` and `SELECT inner_product(vector, ...) ... ORDER BY score DESC`.
+
+### F.4 Verification Test Plan
+
+Before implementation, run these tests on OceanBase 4.3.5.3+:
+
+```sql
+-- Test 1: Verify HNSW_SQ with inner_product
+CREATE TABLE test_sq (id INT PRIMARY KEY, vec VECTOR(128));
+INSERT INTO test_sq VALUES (1, ARRAY_TO_VECTOR('[1.0, 2.0, ...]'));
+CREATE VECTOR INDEX idx_sq ON test_sq(vec) 
+  WITH (distance=inner_product, type=hnsw_sq);
+SELECT id, inner_product(vec, '[...]') AS score FROM test_sq ORDER BY score DESC;
+-- Expected: SUCCESS
+
+-- Test 2: Verify HNSW_BQ with inner_product (the key question)
+CREATE TABLE test_bq (id INT PRIMARY KEY, vec VECTOR(128));
+INSERT INTO test_bq VALUES (1, ARRAY_TO_VECTOR('[1.0, 2.0, ...]'));
+CREATE VECTOR INDEX idx_bq ON test_bq(vec) 
+  WITH (distance=inner_product, type=hnsw_bq);
+-- Expected: SUCCESS if BP3+ supports it, OB_NOT_SUPPORTED if not
+```
+
+
+### F.5 Proposed Implementation Scope
+
+Based on the analysis, here is the proposed scope:
+
+| Scope Item | Phase 1 (Safe) | Phase 2 (If Verified) |
+|------------|----------------|----------------------|
+| HNSW_SQ (8-bit) | ✅ Implement | ✅ Maintain |
+| HNSW_BQ (1-bit) | ❌ Skip | ✅ Implement if BP3+ confirmed |
+| VECTOR_VQ_LEVEL=8 | ✅ Enable HNSW_SQ | ✅ Keep for HNSW_SQ |
+| VECTOR_VQ_LEVEL=1 | ❌ Not implemented | ✅ Enable HNSW_BQ |
+| Min OceanBase version | 4.3.5.1 | 4.3.5.3 |
+| Distance metric | inner_product (no change) | inner_product (no change) |
+
+### F.6 Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| HNSW_SQ doesn't work with inner_product | Low | High | Test before implementation |
+| BP3+ inner_product support is wrong | Medium | Medium | Only implement HNSW_SQ in Phase 1 |
+| Docker image not available | Low | Low | Use specific build tag |
+| Performance regression | Low | Medium | Benchmark before release |
+| Index migration issues | Medium | Medium | Provide clear migration docs |
+
+---
+
+*Appendices E and F added: January 27, 2026*
+*Based on: OceanBase source code analysis and additional research*
+
+---
+
+## Appendix G: Experimental Verification Guide
+
+This guide provides step-by-step instructions to verify HNSW quantization support on OceanBase, closely following official documentation.
+
+### G.1 Environment Setup
+
+#### Option 1: Using Docker (Recommended for Testing)
+
+```bash
+# Step 1: Pull OceanBase images for different BP versions
+# Base version (current FastGPT default)
+docker pull oceanbase/oceanbase-ce:4.3.5-lts
+
+# BP3 version (for inner_product + HNSW_BQ testing)
+docker pull oceanbase/oceanbase-ce:4.3.5.3
+
+# Latest BP5 version
+docker pull oceanbase/oceanbase-ce:4.3.5.5
+
+# Step 2: Start OceanBase container (choose one version)
+# For 4.3.5-lts (base):
+docker run -d --name ob-test-lts \
+  -p 2881:2881 \
+  -e MODE=mini \
+  -e OB_MEMORY_LIMIT=6G \
+  oceanbase/oceanbase-ce:4.3.5-lts
+
+# For 4.3.5.3 (BP3):
+docker run -d --name ob-test-bp3 \
+  -p 2882:2881 \
+  -e MODE=mini \
+  -e OB_MEMORY_LIMIT=6G \
+  oceanbase/oceanbase-ce:4.3.5.3
+
+# Step 3: Wait for initialization (2-3 minutes)
+docker logs -f ob-test-lts  # or ob-test-bp3
+
+# Step 4: Connect to OceanBase
+# For 4.3.5-lts:
+mysql -h127.0.0.1 -P2881 -uroot -p  # password is empty by default
+
+# For 4.3.5.3:
+mysql -h127.0.0.1 -P2882 -uroot -p
+```
+
+#### Option 2: Using OBClient
+
+```bash
+# Install obclient if not available
+# On Ubuntu/Debian:
+wget https://github.com/oceanbase/obclient/releases/download/v2.2.4/obclient_2.2.4-1_amd64.deb
+sudo dpkg -i obclient_2.2.4-1_amd64.deb
+
+# Connect
+obclient -h127.0.0.1 -P2881 -uroot@sys -Doceanbase
+```
+
+### G.2 Version Verification
+
+```sql
+-- Check OceanBase version
+SELECT version();
+-- Expected format: 4.3.5.X-BUILDNUMBER
+-- X = 0 means base (no BP), X = 1 means BP1, etc.
+
+-- Check cluster status
+SELECT * FROM oceanbase.DBA_OB_SERVERS;
+
+-- Verify vector capability is enabled
+SHOW VARIABLES LIKE '%vector%';
+```
+
+### G.3 Test Database Setup
+
+```sql
+-- Create test database
+CREATE DATABASE IF NOT EXISTS vector_test;
+USE vector_test;
+
+-- Create test table with 1536-dimension vectors (OpenAI embedding size)
+CREATE TABLE test_vectors (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    content VARCHAR(500),
+    vector VECTOR(1536) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert sample vectors (use Python script below to generate)
+-- For quick test, use smaller dimension:
+CREATE TABLE test_vectors_128 (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    vector VECTOR(128) NOT NULL
+);
+```
+
+### G.4 Generate Test Vectors (Python Script)
+
+```python
+#!/usr/bin/env python3
+"""
+Generate test vectors and insert into OceanBase.
+Save as: generate_test_vectors.py
+"""
+
+import mysql.connector
+import numpy as np
+import random
+
+def generate_normalized_vector(dim):
+    """Generate a random normalized vector."""
+    vec = np.random.randn(dim)
+    vec = vec / np.linalg.norm(vec)  # Normalize for inner_product
+    return vec.tolist()
+
+def format_vector(vec):
+    """Format vector as OceanBase string."""
+    return '[' + ','.join(f'{v:.6f}' for v in vec) + ']'
+
+def main():
+    # Connect to OceanBase
+    conn = mysql.connector.connect(
+        host='127.0.0.1',
+        port=2881,  # Change to 2882 for BP3 container
+        user='root',
+        password='',
+        database='vector_test'
+    )
+    cursor = conn.cursor()
+    
+    # Generate and insert 1000 test vectors
+    dim = 128  # Use 128 for quick testing, 1536 for production testing
+    batch_size = 100
+    total = 1000
+    
+    print(f"Inserting {total} vectors of dimension {dim}...")
+    
+    for batch_start in range(0, total, batch_size):
+        values = []
+        for i in range(batch_start, min(batch_start + batch_size, total)):
+            vec = generate_normalized_vector(dim)
+            vec_str = format_vector(vec)
+            values.append(f"({vec_str})")
+        
+        sql = f"INSERT INTO test_vectors_128 (vector) VALUES {','.join(values)}"
+        cursor.execute(sql)
+        conn.commit()
+        print(f"Inserted {min(batch_start + batch_size, total)}/{total}")
+    
+    print("Done!")
+    cursor.close()
+    conn.close()
+
+if __name__ == '__main__':
+    main()
+```
+
+**Run the script:**
+```bash
+pip install mysql-connector-python numpy
+python generate_test_vectors.py
+```
+
+### G.5 Experiment 1: Test HNSW (Base - Should Work on All Versions)
+
+```sql
+USE vector_test;
+
+-- Test 1.1: Create HNSW index with inner_product
+CREATE VECTOR INDEX idx_hnsw_ip ON test_vectors_128(vector) 
+WITH (distance=inner_product, type=hnsw, m=16, ef_construction=128);
+-- Expected: SUCCESS on all versions
+
+-- Verify index creation
+SHOW INDEX FROM test_vectors_128;
+
+-- Test 1.2: Search using inner_product
+SET ob_hnsw_ef_search = 64;
+
+SELECT id, inner_product(vector, '[0.1,0.2,...]') AS score  -- Use actual 128-dim vector
+FROM test_vectors_128
+ORDER BY score DESC
+APPROXIMATE LIMIT 10;
+-- Expected: SUCCESS, returns top 10 similar vectors
+
+-- Test 1.3: Check memory usage
+SELECT * FROM V$OB_VECTOR_MEMORY WHERE index_name LIKE '%idx_hnsw%';
+
+-- Clean up
+DROP INDEX idx_hnsw_ip ON test_vectors_128;
+```
+
+### G.6 Experiment 2: Test HNSW_SQ (Requires BP1+)
+
+```sql
+USE vector_test;
+
+-- Test 2.1: Create HNSW_SQ index with inner_product
+CREATE VECTOR INDEX idx_hnsw_sq_ip ON test_vectors_128(vector) 
+WITH (distance=inner_product, type=hnsw_sq, m=16, ef_construction=128);
+-- Expected on 4.3.5-lts: ERROR (feature not available)
+-- Expected on 4.3.5.1+: SUCCESS
+
+-- If successful, verify and test search
+SHOW INDEX FROM test_vectors_128;
+
+SET ob_hnsw_ef_search = 64;
+SELECT id, inner_product(vector, '[0.1,0.2,...]') AS score
+FROM test_vectors_128
+ORDER BY score DESC
+APPROXIMATE LIMIT 10;
+
+-- Compare memory usage with HNSW
+SELECT * FROM V$OB_VECTOR_MEMORY WHERE index_name LIKE '%idx_hnsw_sq%';
+
+-- Clean up
+DROP INDEX idx_hnsw_sq_ip ON test_vectors_128;
+```
+
+### G.7 Experiment 3: Test HNSW_BQ (Requires BP2+)
+
+```sql
+USE vector_test;
+
+-- Test 3.1: Create HNSW_BQ with L2 (should work on BP2+)
+CREATE VECTOR INDEX idx_hnsw_bq_l2 ON test_vectors_128(vector) 
+WITH (distance=l2, type=hnsw_bq, m=16, ef_construction=128);
+-- Expected on 4.3.5-lts: ERROR
+-- Expected on 4.3.5.2+: SUCCESS
+
+-- Test 3.2: Create HNSW_BQ with inner_product (THE KEY TEST)
+CREATE VECTOR INDEX idx_hnsw_bq_ip ON test_vectors_128(vector) 
+WITH (distance=inner_product, type=hnsw_bq, m=16, ef_construction=128);
+-- Expected on 4.3.5-lts: ERROR
+-- Expected on 4.3.5.2: ERROR (OB_NOT_SUPPORTED)
+-- Expected on 4.3.5.3+: ???  <-- This is what we need to verify!
+
+-- If 3.2 succeeds, test search
+SET ob_hnsw_ef_search = 64;
+SELECT id, inner_product(vector, '[0.1,0.2,...]') AS score
+FROM test_vectors_128
+ORDER BY score DESC
+APPROXIMATE LIMIT 10;
+
+-- Check memory savings
+SELECT * FROM V$OB_VECTOR_MEMORY;
+
+-- Clean up
+DROP INDEX idx_hnsw_bq_l2 ON test_vectors_128;
+DROP INDEX idx_hnsw_bq_ip ON test_vectors_128;  -- If created
+```
+
+### G.8 Experiment 4: Test HNSW_BQ with refine_k (Requires BP3+)
+
+```sql
+USE vector_test;
+
+-- Test with refine_k for better recall
+CREATE VECTOR INDEX idx_hnsw_bq_refine ON test_vectors_128(vector) 
+WITH (
+    distance=l2,  -- or inner_product if BP3+ supports it
+    type=hnsw_bq, 
+    m=16, 
+    ef_construction=128,
+    refine_k=4,
+    refine_type=sq8
+);
+-- Expected on < BP3: ERROR (refine_k not recognized)
+-- Expected on BP3+: SUCCESS
+
+-- Compare recall with and without refine_k
+-- Insert a known vector, then search for it
+INSERT INTO test_vectors_128 (vector) VALUES ('[1.0,0,0,0,...]');  -- 128-dim unit vector
+SET @query_vec = '[1.0,0,0,0,...]';
+
+-- Search and check if the exact match appears in top results
+SELECT id, l2_distance(vector, @query_vec) AS dist
+FROM test_vectors_128
+ORDER BY dist ASC
+APPROXIMATE LIMIT 10;
+```
+
+### G.9 Complete Test Script
+
+Save this as `test_oceanbase_hnsw.sql`:
+
+```sql
+-- ===========================================
+-- OceanBase HNSW Quantization Test Script
+-- Run against different OceanBase versions
+-- ===========================================
+
+-- Setup
+CREATE DATABASE IF NOT EXISTS vector_test;
+USE vector_test;
+
+DROP TABLE IF EXISTS test_results;
+CREATE TABLE test_results (
+    test_name VARCHAR(100),
+    ob_version VARCHAR(50),
+    result VARCHAR(20),
+    error_msg TEXT,
+    tested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS test_vec;
+CREATE TABLE test_vec (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    vector VECTOR(128) NOT NULL
+);
+
+-- Insert test data (simple vectors for quick test)
+INSERT INTO test_vec (vector) VALUES 
+    ('[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]'),
+    ('[0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]'),
+    ('[0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]');
+
+-- Get version
+SELECT @ob_version := version();
+SELECT CONCAT('Testing on OceanBase version: ', @ob_version) AS info;
+
+-- ===========================================
+-- TEST 1: HNSW with inner_product (baseline)
+-- ===========================================
+SELECT 'TEST 1: HNSW + inner_product' AS test;
+
+DROP INDEX IF EXISTS idx_test ON test_vec;
+CREATE VECTOR INDEX idx_test ON test_vec(vector) 
+WITH (distance=inner_product, type=hnsw, m=16, ef_construction=64);
+
+INSERT INTO test_results (test_name, ob_version, result) 
+VALUES ('HNSW + inner_product', @ob_version, 'SUCCESS');
+
+DROP INDEX idx_test ON test_vec;
+
+-- ===========================================
+-- TEST 2: HNSW_SQ with inner_product
+-- ===========================================
+SELECT 'TEST 2: HNSW_SQ + inner_product' AS test;
+
+-- This may fail on base 4.3.5-lts
+CREATE VECTOR INDEX idx_test ON test_vec(vector) 
+WITH (distance=inner_product, type=hnsw_sq, m=16, ef_construction=64);
+
+-- If we reach here, it succeeded
+INSERT INTO test_results (test_name, ob_version, result) 
+VALUES ('HNSW_SQ + inner_product', @ob_version, 'SUCCESS');
+
+DROP INDEX idx_test ON test_vec;
+
+-- ===========================================
+-- TEST 3: HNSW_BQ with L2
+-- ===========================================
+SELECT 'TEST 3: HNSW_BQ + L2' AS test;
+
+CREATE VECTOR INDEX idx_test ON test_vec(vector) 
+WITH (distance=l2, type=hnsw_bq, m=16, ef_construction=64);
+
+INSERT INTO test_results (test_name, ob_version, result) 
+VALUES ('HNSW_BQ + L2', @ob_version, 'SUCCESS');
+
+DROP INDEX idx_test ON test_vec;
+
+-- ===========================================
+-- TEST 4: HNSW_BQ with inner_product (KEY TEST)
+-- ===========================================
+SELECT 'TEST 4: HNSW_BQ + inner_product (KEY TEST)' AS test;
+
+CREATE VECTOR INDEX idx_test ON test_vec(vector) 
+WITH (distance=inner_product, type=hnsw_bq, m=16, ef_construction=64);
+
+-- If we reach here, BP3+ supports inner_product for HNSW_BQ!
+INSERT INTO test_results (test_name, ob_version, result) 
+VALUES ('HNSW_BQ + inner_product', @ob_version, 'SUCCESS');
+
+DROP INDEX idx_test ON test_vec;
+
+-- ===========================================
+-- TEST 5: HNSW_BQ with refine_k
+-- ===========================================
+SELECT 'TEST 5: HNSW_BQ + refine_k' AS test;
+
+CREATE VECTOR INDEX idx_test ON test_vec(vector) 
+WITH (distance=l2, type=hnsw_bq, m=16, ef_construction=64, refine_k=4);
+
+INSERT INTO test_results (test_name, ob_version, result) 
+VALUES ('HNSW_BQ + refine_k', @ob_version, 'SUCCESS');
+
+DROP INDEX idx_test ON test_vec;
+
+-- ===========================================
+-- Show Results
+-- ===========================================
+SELECT '========== TEST RESULTS ==========' AS separator;
+SELECT * FROM test_results ORDER BY tested_at;
+
+-- Clean up
+DROP TABLE test_vec;
+```
+
+### G.10 Running the Experiments
+
+```bash
+# Step 1: Start both containers
+docker run -d --name ob-lts -p 2881:2881 -e MODE=mini -e OB_MEMORY_LIMIT=6G oceanbase/oceanbase-ce:4.3.5-lts
+docker run -d --name ob-bp3 -p 2882:2881 -e MODE=mini -e OB_MEMORY_LIMIT=6G oceanbase/oceanbase-ce:4.3.5.3
+
+# Step 2: Wait for initialization
+sleep 180  # 3 minutes
+
+# Step 3: Run tests on base version
+mysql -h127.0.0.1 -P2881 -uroot < test_oceanbase_hnsw.sql 2>&1 | tee results_lts.txt
+
+# Step 4: Run tests on BP3 version  
+mysql -h127.0.0.1 -P2882 -uroot < test_oceanbase_hnsw.sql 2>&1 | tee results_bp3.txt
+
+# Step 5: Compare results
+echo "=== 4.3.5-lts Results ===" && cat results_lts.txt
+echo ""
+echo "=== 4.3.5.3 (BP3) Results ===" && cat results_bp3.txt
+
+# Step 6: Clean up containers when done
+docker stop ob-lts ob-bp3
+docker rm ob-lts ob-bp3
+```
+
+### G.11 Expected Results Matrix
+
+| Test | 4.3.5-lts (BP0) | 4.3.5.1 (BP1) | 4.3.5.2 (BP2) | 4.3.5.3 (BP3) |
+|------|-----------------|---------------|---------------|---------------|
+| HNSW + inner_product | ✅ SUCCESS | ✅ SUCCESS | ✅ SUCCESS | ✅ SUCCESS |
+| HNSW_SQ + inner_product | ❌ ERROR | ✅ SUCCESS | ✅ SUCCESS | ✅ SUCCESS |
+| HNSW_BQ + L2 | ❌ ERROR | ❌ ERROR | ✅ SUCCESS | ✅ SUCCESS |
+| HNSW_BQ + inner_product | ❌ ERROR | ❌ ERROR | ❌ ERROR | ❓ **VERIFY** |
+| HNSW_BQ + refine_k | ❌ ERROR | ❌ ERROR | ❌ ERROR | ✅ SUCCESS |
+
+### G.12 Evidence Collection Template
+
+After running experiments, document results using this template:
+
+```markdown
+## Experiment Report
+
+**Date**: YYYY-MM-DD
+**Tester**: [Name]
+**OceanBase Version**: [e.g., 4.3.5.3-xxx]
+
+### Environment
+- Docker image: oceanbase/oceanbase-ce:X.X.X
+- Host OS: [e.g., Ubuntu 22.04]
+- Memory allocated: 6GB
+
+### Results
+
+| Test Case | Expected | Actual | Notes |
+|-----------|----------|--------|-------|
+| HNSW + IP | SUCCESS | | |
+| HNSW_SQ + IP | SUCCESS | | |
+| HNSW_BQ + L2 | SUCCESS | | |
+| HNSW_BQ + IP | ??? | | **KEY FINDING** |
+| HNSW_BQ + refine_k | SUCCESS | | |
+
+### Error Messages (if any)
+```
+[Paste error messages here]
+```
+
+### Memory Usage Comparison
+| Index Type | Memory (MB) | Compression Ratio |
+|------------|-------------|-------------------|
+| HNSW | | 1.0x |
+| HNSW_SQ | | |
+| HNSW_BQ | | |
+
+### Conclusions
+- [ ] HNSW_SQ supports inner_product: YES / NO
+- [ ] HNSW_BQ supports inner_product on BP3+: YES / NO
+- [ ] Recommended OceanBase version for FastGPT: X.X.X
+```
+
+---
+
+*Appendix G added: January 27, 2026*
+*Based on OceanBase official documentation and Docker Hub*
