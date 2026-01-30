@@ -1,99 +1,19 @@
 # OceanBase HNSW Quantization Implementation Plan
 
-> **Status**: Ready for Implementation (HNSW_SQ only)  
-> **Date**: January 28, 2026  
-> **Blocker**: HNSW_BQ does NOT support `inner_product` distance
+> **Status**: ✅ Ready for Implementation  
+> **Date**: January 30, 2026  
+> **Scope**: HNSW_SQ (8-bit) and HNSW_BQ (1-bit) with different distance algorithms
 
 ---
 
-## 0. Scope Check Questions for Maintainers
+## 0. Maintainer Decisions (Confirmed)
 
-> **Before implementation, please clarify the following scope questions:**
-
-### Q1: HNSW_BQ Distance Support - Cosine vs Inner Product
-
-**Context from OceanBase Docs** ([200.ob-vector-index.md](oceanbase-doc-4.3.5/zh-CN/640.ob-vector-search/200.ob-vector-index.md#L310)):
-> "HNSW_BQ 索引 `distance` 参数支持 l2 和 cosine。cosine 从 V4.3.5 BP4 版本开始支持。"
-
-**Issue**: FastGPT uses `inner_product` for all vector databases, but HNSW_BQ only supports `l2` and `cosine`. 
-
-**Question**: Should we:
-- **(A)** Only implement HNSW_SQ (8-bit) for now, skipping HNSW_BQ (1-bit)?
-- **(B)** Implement HNSW_BQ with `cosine` distance as a fallback (requires `ORDER BY score asc` instead of `desc` for L2, or cosine normalization)?
-- **(C)** Wait for OceanBase to add `inner_product` support for HNSW_BQ?
-
-**Recommendation**: Option (A) - implement HNSW_SQ only, since HNSW_SQ supports `inner_product` and provides 2-3x memory savings.
-
----
-
-### Q2: HNSW Parameter Defaults (m, ef_construction, ef_search)
-
-**Context from Official Docs** ([OceanBase Vector Best Practices](https://www.oceanbase.com/docs/common-oceanbase-database-cn-1000000004920602)):
-```
-百万数据量：m = 16，ef_construction = 200，ef_search = 100，其他参数默认
-千万数据量：m = 32，ef_construction = 400，ef_search = 1000，refine_k = 10，其他参数默认
-亿级数据量：使用分区表，m = 32，ef_construction = 400，ef_search = 1000，refine_k = 10，其他参数默认
-```
-
-**Current FastGPT defaults** (both OceanBase and PGVector):
-```sql
-m=32, ef_construction=128
-```
-
-**Question**: Should we:
-- **(A)** Keep current defaults (`m=32, ef_construction=128`) for consistency with PGVector?
-- **(B)** Update to OceanBase recommended values (`ef_construction=200` for <1M, `ef_construction=400` for >1M)?
-- **(C)** Make these configurable via environment variables (e.g., `OCEANBASE_HNSW_M`, `OCEANBASE_HNSW_EF_CONSTRUCTION`)?
-
-**Note**: PGVector's implementation uses fixed `m=32, ef_construction=128` without environment variable configuration. The `ob_hnsw_ef_search` is already configurable via `global.systemEnv?.hnswEfSearch` at query time.
-
----
-
-### Q3: Index Migration for Existing Databases
-
-**Context**: Changing from `type=hnsw` to `type=hnsw_sq` requires a different index type. The existing `CREATE VECTOR INDEX IF NOT EXISTS` pattern will **NOT** recreate the index if it already exists.
-
-**Current code** ([oceanbase/index.ts#L24](packages/service/common/vectorDB/oceanbase/index.ts#L24)):
-```sql
-CREATE VECTOR INDEX IF NOT EXISTS vector_index ON ${DatasetVectorTableName}(vector) 
-  WITH (distance=inner_product, type=hnsw, m=32, ef_construction=128);
-```
-
-**Question**: For users with existing OceanBase deployments who want to switch to HNSW_SQ:
-- **(A)** Document only - Users must manually `DROP INDEX vector_index` then restart to recreate?
-- **(B)** Provide a migration script/API endpoint to drop and recreate the index?
-- **(C)** Auto-detect index type mismatch and prompt/warn users (no auto-migration)?
-- **(D)** This feature is for **new deployments only** - no migration support needed?
-
-**OceanBase Context**: OceanBase supports `DBMS_VECTOR.REBUILD_INDEX` for full refresh, but this rebuilds same type, not conversion. Changing index type requires `DROP INDEX` + `CREATE INDEX`.
-
----
-
-### Q4: Environment Variable Naming Convention
-
-**Current PGVector pattern** ([constants.ts](packages/service/common/vectorDB/constants.ts)):
-```typescript
-export const VectorVQ = (() => {
-  if (process.env.VECTOR_VQ_LEVEL === '32') return 32;  // Full precision
-  if (process.env.VECTOR_VQ_LEVEL === '16') return 16;  // Half precision (HALFVEC)
-  if (process.env.VECTOR_VQ_LEVEL === '8') return 8;    // (currently unused)
-  // ...
-})();
-```
-
-**Proposed mapping for OceanBase**:
-| `VECTOR_VQ_LEVEL` | PGVector | OceanBase |
-|-------------------|----------|-----------|
-| `32` (default) | `VECTOR` | `hnsw` |
-| `16` | `HALFVEC` | `hnsw` (no change - OB has no half-precision) |
-| `8` | - | `hnsw_sq` |
-| `1` | - | `hnsw_bq` (BLOCKED - no inner_product) |
-
-**Question**: Is this naming convention acceptable, or should OceanBase have its own env var (e.g., `OCEANBASE_INDEX_TYPE`)?
-
-**Trade-offs**:
-- Reusing `VECTOR_VQ_LEVEL=8` is consistent but `8` doesn't represent "bits" for OceanBase (SQ is 8-bit quantization, but the env var originally meant precision bits)
-- Separate env var is clearer but adds configuration complexity
+| Question | Decision | Implication |
+|----------|----------|-------------|
+| **Q1: HNSW_BQ distance** | ✅ Build different SQL per quantization level | HNSW_BQ uses `cosine`, HNSW/HNSW_SQ use `inner_product` |
+| **Q2: Env var naming** | ✅ Use numbers directly (`VECTOR_VQ_LEVEL`) | `32`=hnsw, `8`=hnsw_sq, `1`=hnsw_bq |
+| **Q3: HNSW parameters** | ✅ Use million-level defaults | `m=16, ef_construction=200` (code creates first time only) |
+| **Q4: Index migration** | ✅ Document only, no code migration | Users manually `DROP INDEX` + restart if switching types |
 
 ---
 
@@ -107,157 +27,280 @@ Docker tag `4.3.5-lts` = Version `4.3.5.5` (BP5)
 
 ### Compatibility Matrix
 
-| Index Type | inner_product | Status |
-|------------|:-------------:|--------|
-| HNSW (32-bit) | ✅ | Current default |
-| **HNSW_SQ (8-bit)** | ✅ | **Ready to implement** |
-| HNSW_BQ (1-bit) | ❌ | **BLOCKED** - only supports l2/cosine |
-
-### Recommendation
-Implement **HNSW_SQ only** via `VECTOR_VQ_LEVEL=8`.
-
+| Index Type | Distance | Status |
+|------------|:--------:|--------|
+| HNSW (32-bit) | `inner_product` | Current default |
+| **HNSW_SQ (8-bit)** | `inner_product` | **Ready to implement** |
+| **HNSW_BQ (1-bit)** | `cosine` | **Ready to implement** (different distance) |
 
 ---
 
-## 2. Validation Commands
+## 2. Implementation Details
 
-### 2.1 Verify OceanBase Version
-```bash
-docker run --rm oceanbase/oceanbase-ce:4.3.5-lts cat /home/admin/oceanbase/etc/observer.conf.bin 2>/dev/null || \
-docker logs $(docker ps -qf "ancestor=oceanbase/oceanbase-ce:4.3.5-lts") 2>&1 | grep "installed"
-# Expected: oceanbase-ce-4.3.5.5 already installed
-```
+### 2.1 File Changes Overview
 
-### 2.2 Test HNSW_SQ with inner_product
-```sql
--- Connect to OceanBase
-CREATE TABLE test_sq (id INT PRIMARY KEY, vec VECTOR(128));
-INSERT INTO test_sq VALUES (1, '[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]');
-
--- Create HNSW_SQ index with inner_product (should succeed)
-CREATE VECTOR INDEX idx_sq ON test_sq(vec) 
-  WITH (distance=inner_product, type=hnsw_sq, m=16, ef_construction=128);
-
--- Verify search works
-SELECT id, inner_product(vec, '[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]') AS score 
-FROM test_sq ORDER BY score DESC APPROXIMATE LIMIT 10;
-
--- Clean up
-DROP TABLE test_sq;
-```
-
-### 2.3 Test HNSW_BQ with inner_product (Expected to FAIL)
-```sql
-CREATE TABLE test_bq (id INT PRIMARY KEY, vec VECTOR(128));
-INSERT INTO test_bq VALUES (1, '[1,0,0,...]');
-
--- This should fail with OB_NOT_SUPPORTED
-CREATE VECTOR INDEX idx_bq ON test_bq(vec) 
-  WITH (distance=inner_product, type=hnsw_bq, m=16, ef_construction=128);
--- Expected error: distance parameter only supports l2
-
-DROP TABLE test_bq;
-```
-
+| File | Change |
+|------|--------|
+| `packages/service/common/vectorDB/constants.ts` | Add `OceanBaseIndexConfig` export |
+| `packages/service/common/vectorDB/oceanbase/index.ts` | Use dynamic index/query config |
 
 ---
 
-## 3. Implementation Plan
+### 2.2 constants.ts Changes
 
-### 3.1 Code Changes
+**Location**: `packages/service/common/vectorDB/constants.ts`
 
-**File 1**: `packages/service/common/vectorDB/constants.ts`
 ```typescript
-// Add after VectorVQ definition
-export const OceanBaseIndexType = (() => {
-  if (process.env.VECTOR_VQ_LEVEL === '8') return 'hnsw_sq';
-  return 'hnsw';
+// After existing VectorVQ definition (line ~27)
+
+/**
+ * OceanBase Index Configuration based on VECTOR_VQ_LEVEL
+ * 
+ * | Level | Index Type | Distance       | Memory Savings |
+ * |-------|------------|----------------|----------------|
+ * | 32    | hnsw       | inner_product  | 1x (baseline)  |
+ * | 8     | hnsw_sq    | inner_product  | 2-3x           |
+ * | 1     | hnsw_bq    | cosine         | ~15x           |
+ */
+export const OceanBaseIndexConfig = (() => {
+  const level = process.env.VECTOR_VQ_LEVEL;
+  
+  if (level === '1') {
+    // HNSW_BQ: 1-bit binary quantization
+    // Note: HNSW_BQ only supports l2/cosine, NOT inner_product
+    return {
+      type: 'hnsw_bq',
+      distance: 'cosine',
+      distanceFunc: 'cosine_distance',
+      orderDirection: 'ASC',  // cosine_distance: smaller = more similar
+      scoreTransform: (score: number) => 1 - score / 2  // Convert to similarity [0,1]
+    };
+  }
+  
+  if (level === '8') {
+    // HNSW_SQ: 8-bit scalar quantization
+    return {
+      type: 'hnsw_sq',
+      distance: 'inner_product',
+      distanceFunc: 'inner_product',
+      orderDirection: 'DESC',  // inner_product: larger = more similar
+      scoreTransform: (score: number) => score
+    };
+  }
+  
+  // Default: Full precision HNSW
+  return {
+    type: 'hnsw',
+    distance: 'inner_product',
+    distanceFunc: 'inner_product',
+    orderDirection: 'DESC',
+    scoreTransform: (score: number) => score
+  };
 })();
 ```
 
-**File 2**: `packages/service/common/vectorDB/oceanbase/index.ts`
+---
+
+### 2.3 oceanbase/index.ts Changes
+
+**Location**: `packages/service/common/vectorDB/oceanbase/index.ts`
+
+#### Change 1: Import the config
+
 ```typescript
-// Import the constant
-import { OceanBaseIndexType } from '../constants';
-
-// Modify index creation (in init function)
-// FROM: type=hnsw
-// TO:   type=${OceanBaseIndexType}
+// Line 2: Update import
+import { DatasetVectorTableName, OceanBaseIndexConfig } from '../constants';
 ```
 
-### 3.2 Environment Variable
+#### Change 2: Update init() - Index Creation
 
-```bash
-# .env
-VECTOR_VQ_LEVEL=8  # Enables HNSW_SQ (8-bit) for OceanBase
+```typescript
+// Line 23-25: Replace the CREATE VECTOR INDEX statement
+await ObClient.query(
+  `CREATE VECTOR INDEX IF NOT EXISTS vector_index ON ${DatasetVectorTableName}(vector) WITH (distance=${OceanBaseIndexConfig.distance}, type=${OceanBaseIndexConfig.type}, m=16, ef_construction=200);`
+);
 ```
 
-| VECTOR_VQ_LEVEL | PgVector | OceanBase |
-|-----------------|----------|-----------|
-| 32 (default) | VECTOR | HNSW |
-| 16 | HALFVEC | HNSW (no change) |
-| **8** | - | **HNSW_SQ** |
+**Key changes from current code**:
+- `distance=inner_product` → `distance=${OceanBaseIndexConfig.distance}`
+- `type=hnsw` → `type=${OceanBaseIndexConfig.type}`
+- `m=32` → `m=16` (OceanBase million-level recommendation)
+- `ef_construction=128` → `ef_construction=200` (OceanBase recommendation)
 
+#### Change 3: Update embRecall() - Query
+
+```typescript
+// Line 133-143: Replace the SELECT query
+const rows = await ObClient.query<
+  ({
+    id: string;
+    collection_id: string;
+    score: number;
+  } & RowDataPacket)[][]
+>(
+  `BEGIN;
+      SET ob_hnsw_ef_search = ${global.systemEnv?.hnswEfSearch || 100};
+      SELECT id, collection_id, ${OceanBaseIndexConfig.distanceFunc}(vector, [${vector}]) AS score
+        FROM ${DatasetVectorTableName}
+        WHERE team_id='${teamId}'
+          AND dataset_id IN (${datasetIds.map((id) => `'${String(id)}'`).join(',')})
+          ${filterCollectionIdSql}
+          ${forbidCollectionSql}
+        ORDER BY score ${OceanBaseIndexConfig.orderDirection} APPROXIMATE LIMIT ${limit};
+    COMMIT;`
+).then(([rows]) => rows[2]);
+
+return {
+  results: rows.map((item) => ({
+    id: String(item.id),
+    collectionId: item.collection_id,
+    score: OceanBaseIndexConfig.scoreTransform(item.score)
+  }))
+};
+```
+
+**Key changes**:
+- `inner_product(vector, ...)` → `${OceanBaseIndexConfig.distanceFunc}(vector, ...)`
+- `ORDER BY score desc` → `ORDER BY score ${OceanBaseIndexConfig.orderDirection}`
+- Add score transformation for cosine_distance compatibility
 
 ---
 
-## 4. BLOCKER: HNSW_BQ + inner_product
+## 3. Configuration Summary
 
-### The Problem
+### Environment Variable Mapping
 
-FastGPT uses `inner_product` for ALL vector databases:
-```typescript
-// oceanbase/index.ts
-WITH (distance=inner_product, type=hnsw, ...)
-SELECT ... inner_product(vector, [...]) AS score ... ORDER BY score desc
-```
+| `VECTOR_VQ_LEVEL` | PGVector | OceanBase Index | Distance | Memory |
+|-------------------|----------|-----------------|----------|--------|
+| `32` (default) | `VECTOR` | `hnsw` | `inner_product` | 100% |
+| `16` | `HALFVEC` | `hnsw` | `inner_product` | 100% |
+| `8` | — | `hnsw_sq` | `inner_product` | ~40% |
+| `1` | — | `hnsw_bq` | `cosine` | ~7% |
 
-OceanBase HNSW_BQ **does NOT support inner_product**:
+### Index Parameters (Million-level defaults)
 
-> **Source**: `oceanbase-doc-4.3.5/en-US/640.ob-vector-search/200.ob-vector-index.md` (Line 310)
-> 
-> "The `distance` parameter of an HNSW_BQ index only supports l2"
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `m` | 16 | OceanBase recommendation for <1M vectors |
+| `ef_construction` | 200 | OceanBase recommendation for <1M vectors |
+| `ef_search` | 100 | Configurable via `global.systemEnv?.hnswEfSearch` |
 
-### Questions for OceanBase Team
+---
 
-1. **Is there any plan to add `inner_product` support for HNSW_BQ?**
-   - Current: Only l2 and cosine (cosine from BP4+)
-   - FastGPT requires inner_product for consistency across all vector DBs
+## 4. Migration Guide (Documentation Only)
 
-2. **Source code shows `is_enable_bp_cosine_and_ip` flag for BP3+**
-   - Does this actually enable inner_product for HNSW_BQ in versions [4.3.5.3, 4.4.0.0)?
-   - Documentation says no, but code suggests maybe?
+### For Existing OceanBase Deployments
 
-### Questions for FastGPT Team
+Per maintainer decision, migration is **not handled in code**. Users switching index types must:
 
-1. **Should HNSW_BQ be implemented with L2 distance as an alternative?**
-   - Would require separate env var (e.g., `OCEANBASE_DISTANCE=l2`)
-   - Changes `ORDER BY score desc` to `ORDER BY score asc`
-   - Breaks consistency with other vector DBs
+1. **Connect to OceanBase directly**:
+   ```bash
+   mysql -h <host> -P <port> -u <user> -p<password> -D fastgpt
+   ```
 
-2. **Or wait for OceanBase to support inner_product for HNSW_BQ?**
+2. **Drop the existing index**:
+   ```sql
+   DROP INDEX vector_index ON modeldata;
+   ```
 
+3. **Set the environment variable** and restart FastGPT:
+   ```bash
+   VECTOR_VQ_LEVEL=8  # For HNSW_SQ
+   # or
+   VECTOR_VQ_LEVEL=1  # For HNSW_BQ
+   ```
+
+4. **FastGPT will recreate the index** on startup with the new type.
+
+### Important Notes
+
+- **hnsw ↔ hnsw_sq**: Supported via `DBMS_VECTOR.REBUILD_INDEX` (but we use DROP+CREATE for simplicity)
+- **hnsw ↔ hnsw_bq**: **NOT** supported via REBUILD_INDEX; requires DROP+CREATE
+- Code uses `IF NOT EXISTS`, so it won't recreate if index already exists
 
 ---
 
 ## 5. Memory Comparison
 
-| Index Type | Memory (1M × 1536 dims) | Compression |
-|------------|-------------------------|-------------|
-| HNSW | ~6 GB | 1x |
-| HNSW_SQ | ~2-3 GB | 2-3x |
-| HNSW_BQ | ~405 MB | 15x |
+| Index Type | Memory (1M × 1536 dims) | Compression | Use Case |
+|------------|-------------------------|-------------|----------|
+| HNSW | ~6 GB | 1x | Maximum recall |
+| HNSW_SQ | ~2-3 GB | 2-3x | Balanced |
+| HNSW_BQ | ~405 MB | 15x | Memory-constrained |
 
 ---
 
-## 6. Next Steps
+## 6. Testing Checklist
+
+### Unit Tests
+
+- [ ] `VECTOR_VQ_LEVEL=32` → Creates `type=hnsw, distance=inner_product`
+- [ ] `VECTOR_VQ_LEVEL=8` → Creates `type=hnsw_sq, distance=inner_product`
+- [ ] `VECTOR_VQ_LEVEL=1` → Creates `type=hnsw_bq, distance=cosine`
+- [ ] Query with HNSW_BQ uses `cosine_distance` and `ORDER BY ASC`
+- [ ] Score transformation for HNSW_BQ returns values in expected range
+
+### Integration Tests
+
+- [ ] HNSW_SQ index creation succeeds on OceanBase 4.3.5 BP5
+- [ ] HNSW_BQ index creation succeeds on OceanBase 4.3.5 BP5
+- [ ] Vector search returns correct results with HNSW_SQ
+- [ ] Vector search returns correct results with HNSW_BQ
+- [ ] Recall rate is acceptable (>90%) for both index types
+
+---
+
+## 7. SQL Reference
+
+### HNSW (Full Precision)
+```sql
+-- Index
+CREATE VECTOR INDEX IF NOT EXISTS vector_index ON modeldata(vector) 
+  WITH (distance=inner_product, type=hnsw, m=16, ef_construction=200);
+
+-- Query
+SELECT id, collection_id, inner_product(vector, [...]) AS score
+  FROM modeldata WHERE ...
+  ORDER BY score DESC APPROXIMATE LIMIT 10;
+```
+
+### HNSW_SQ (8-bit)
+```sql
+-- Index
+CREATE VECTOR INDEX IF NOT EXISTS vector_index ON modeldata(vector) 
+  WITH (distance=inner_product, type=hnsw_sq, m=16, ef_construction=200);
+
+-- Query (same as HNSW)
+SELECT id, collection_id, inner_product(vector, [...]) AS score
+  FROM modeldata WHERE ...
+  ORDER BY score DESC APPROXIMATE LIMIT 10;
+```
+
+### HNSW_BQ (1-bit)
+```sql
+-- Index (note: cosine distance, NOT inner_product)
+CREATE VECTOR INDEX IF NOT EXISTS vector_index ON modeldata(vector) 
+  WITH (distance=cosine, type=hnsw_bq, m=16, ef_construction=200);
+
+-- Query (note: cosine_distance and ASC order)
+SELECT id, collection_id, cosine_distance(vector, [...]) AS score
+  FROM modeldata WHERE ...
+  ORDER BY score ASC APPROXIMATE LIMIT 10;
+```
+
+---
+
+## 8. Next Steps
 
 - [x] Verify 4.3.5-lts = 4.3.5.5 (BP5) ✅
-- [x] Confirm HNSW_BQ does NOT support inner_product ✅
-- [ ] Test HNSW_SQ with inner_product on running OceanBase
-- [ ] Implement HNSW_SQ support (Phase 1)
-- [ ] Decide on HNSW_BQ approach (blocked pending answers)
+- [x] Confirm HNSW_BQ distance limitations ✅
+- [x] Get maintainer decisions ✅
+- [ ] Implement `OceanBaseIndexConfig` in constants.ts
+- [ ] Update oceanbase/index.ts init() and embRecall()
+- [ ] Add documentation to FastGPT docs
+- [ ] Test on running OceanBase instance
+- [ ] Submit PR
 
 ---
 
-*Simplified from 1400-line document. Full version: OCEANBASE_HNSW_QUANTIZATION_PLAN_old.md*
+*Updated: January 30, 2026 - Added maintainer decisions and complete implementation details*
